@@ -62,6 +62,11 @@ function broadcast(room, type, payload = {}) {
   }
 }
 
+function sendToHost(room, type, payload = {}) {
+  const host = room.hostId ? room.players.get(room.hostId) : null;
+  if (host) send(host.socket, type, payload);
+}
+
 function makeClientId() {
   return `p_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 }
@@ -86,12 +91,19 @@ function createRoom({ quick = false } = {}) {
     size: ROOM_SIZE,
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    hostId: null,
     players: new Map(),
     bots: [],
   };
   rooms.set(code, room);
   ensureBots(room);
   return room;
+}
+
+function assignHost(room) {
+  if (room.hostId && room.players.has(room.hostId)) return;
+  const firstPlayer = room.players.keys().next();
+  room.hostId = firstPlayer.done ? null : firstPlayer.value;
 }
 
 function ensureBots(room) {
@@ -114,6 +126,7 @@ function publicRoom(room) {
   return {
     code: room.code,
     size: room.size,
+    hostId: room.hostId,
     playerCount: room.players.size,
     botCount: room.bots.length,
     quick: room.quick,
@@ -140,6 +153,7 @@ function leaveRoom(client) {
   const room = rooms.get(session.roomCode);
   if (room) {
     room.players.delete(session.id);
+    assignHost(room);
     ensureBots(room);
     broadcast(room, "room_state", { room: publicRoom(room) });
 
@@ -165,6 +179,7 @@ function enterRoom(client, room, profile) {
     skinIndex: session.skinIndex,
     lastInput: {},
   });
+  assignHost(room);
   ensureBots(room);
 
   send(client, "joined_room", { selfId: session.id, room: publicRoom(room) });
@@ -230,10 +245,39 @@ function handleMessage(client, data) {
     const player = room?.players.get(session?.id);
     if (!player) return;
     player.lastInput = {
+      ...(message.input || {}),
       at: Date.now(),
-      keys: message.keys || {},
-      pointer: message.pointer || null,
     };
+    if (session.id !== room.hostId) {
+      sendToHost(room, "player_input", {
+        playerId: session.id,
+        input: player.lastInput,
+      });
+    }
+    return;
+  }
+
+  if (message.type === "command") {
+    const session = clients.get(client);
+    const room = rooms.get(session?.roomCode);
+    const player = room?.players.get(session?.id);
+    if (!player || session.id === room.hostId) return;
+    sendToHost(room, "player_command", {
+      playerId: session.id,
+      command: message.command,
+      delta: message.delta,
+    });
+    return;
+  }
+
+  if (message.type === "world_state") {
+    const session = clients.get(client);
+    const room = rooms.get(session?.roomCode);
+    if (!room || session?.id !== room.hostId) return;
+    broadcast(room, "world_state", {
+      hostId: room.hostId,
+      state: message.state,
+    });
     return;
   }
 
