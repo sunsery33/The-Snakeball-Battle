@@ -62,6 +62,8 @@
   const STRETCH_MAX_SEGMENTS = 42;
   const LENGTH_ADJUST_STEP = 1;
   const MIN_CHUBBY_UNIT_MASS = 12.5;
+  const ONLINE_INPUT_INTERVAL = 0.05;
+  const ONLINE_STATE_INTERVAL = 0.08;
 
   const palettes = [
     { main: "#4de0ff", light: "#d9fbff", dark: "#087d9b", ring: "#ffffff" },
@@ -112,6 +114,18 @@
   let onlineRoom = null;
   let onlineSelfId = null;
   let onlineConnecting = false;
+
+  const onlineGame = {
+    active: false,
+    hosting: false,
+    roomCode: null,
+    hostId: null,
+    pendingLaunch: null,
+    inputs: new Map(),
+    lastInputSent: 0,
+    lastStateSent: 0,
+    snapshotAge: 0,
+  };
 
   const keys = new Set();
   const pointer = {
@@ -326,7 +340,9 @@
       id,
       name: options.name || (isPlayer ? "You" : aiNames[id % aiNames.length]),
       color,
+      skinIndex: options.skinIndex ?? 0,
       isPlayer,
+      isHuman: Boolean(options.isHuman ?? isPlayer),
       demoBot: Boolean(options.demoBot),
       segments,
       angle,
@@ -348,6 +364,7 @@
       spikeDragSeverity: 0,
       digestMass: 0,
       stun: 0,
+      respawnTimer: 0,
       invulnerable: options.invulnerable ?? (isPlayer ? 0.75 : 1.2),
       alive: true,
       kills: 0,
@@ -711,6 +728,10 @@
     syncProfileFromInput();
     playerNameInput.blur();
     startPlayButton.blur();
+    if (onlineRoom) {
+      startOnlineMatch(onlineRoom);
+      return;
+    }
     resetGame({ menu: false, silent: true });
     showToast(`${profile.name} entered the arena`);
   }
@@ -744,6 +765,11 @@
   }
 
   function returnToLobby() {
+    if (onlineGame.active || onlineRoom) {
+      sendOnline("leave_room");
+      onlineRoom = null;
+      onlineGame.pendingLaunch = null;
+    }
     resetGame({ menu: true, silent: true });
   }
 
@@ -802,14 +828,323 @@
     return true;
   }
 
+  function paletteForSkin(index) {
+    return palettes[clamp(Number.isInteger(index) ? index : 0, 0, palettes.length - 1)];
+  }
+
+  function readLocalOnlineInput() {
+    const player = game.player;
+    const head = player?.segments?.[0];
+    let vx = 0;
+    let vy = 0;
+
+    if (keys.has("KeyA") || keys.has("ArrowLeft")) vx -= 1;
+    if (keys.has("KeyD") || keys.has("ArrowRight")) vx += 1;
+    if (keys.has("KeyW") || keys.has("ArrowUp")) vy -= 1;
+    if (keys.has("KeyS") || keys.has("ArrowDown")) vy += 1;
+
+    const targetAngle = vx || vy
+      ? Math.atan2(vy, vx)
+      : head
+        ? angleTo(head.x, head.y, pointer.worldX, pointer.worldY)
+        : 0;
+
+    return {
+      targetAngle,
+      mergeHold: keys.has("Space"),
+      boostHold: keys.has("KeyV") || pointer.leftDown,
+      spitHold: keys.has("KeyF"),
+    };
+  }
+
+  function sanitizeOnlineInput(input = {}) {
+    return {
+      targetAngle: Number.isFinite(input.targetAngle) ? input.targetAngle : 0,
+      mergeHold: Boolean(input.mergeHold),
+      boostHold: Boolean(input.boostHold),
+      spitHold: Boolean(input.spitHold),
+    };
+  }
+
+  function applyControlToSnake(snake, input) {
+    if (!snake || !snake.alive) return;
+
+    const control = sanitizeOnlineInput(input);
+    snake.targetAngle = control.targetAngle;
+
+    const canContinueMerge = snake.mergeHold && snake.mergeEnergy > 0;
+    snake.mergeHold = control.mergeHold && (canContinueMerge || canStartMerge(snake));
+    snake.boostHold = control.boostHold;
+
+    if (control.spitHold && snake.merge <= 0.14) {
+      spitFood(snake);
+    }
+  }
+
+  function sendOnlineInput(dt) {
+    if (!onlineGame.active) return;
+
+    onlineGame.lastInputSent += dt;
+    if (onlineGame.lastInputSent < ONLINE_INPUT_INTERVAL) return;
+    onlineGame.lastInputSent = 0;
+    sendOnline("input", { input: readLocalOnlineInput() });
+  }
+
+  function applyOnlineHostInputs() {
+    if (!onlineGame.active || !onlineGame.hosting) return;
+
+    onlineGame.inputs.set(onlineSelfId, readLocalOnlineInput());
+    for (const snake of game.snakes) {
+      if (!snake.isHuman) continue;
+      applyControlToSnake(snake, onlineGame.inputs.get(snake.id));
+    }
+  }
+
+  function sendOnlineLengthCommand(delta) {
+    if (!onlineGame.active) return false;
+
+    if (onlineGame.hosting) {
+      return adjustSnakeLength(game.player, delta);
+    }
+
+    sendOnline("command", { command: "length", delta });
+    return true;
+  }
+
+  function handleOnlineCommand(playerId, command, delta) {
+    if (!onlineGame.hosting || command !== "length") return;
+    const snake = game.snakes.find((candidate) => candidate.id === playerId);
+    adjustSnakeLength(snake, Number(delta) > 0 ? LENGTH_ADJUST_STEP : -LENGTH_ADJUST_STEP);
+  }
+
+  function serializeWorldState() {
+    return {
+      elapsed: game.elapsed,
+      snakes: game.snakes.map((snake) => ({
+        id: snake.id,
+        name: snake.name,
+        skinIndex: snake.skinIndex,
+        isHuman: snake.isHuman,
+        alive: snake.alive,
+        angle: snake.angle,
+        targetAngle: snake.targetAngle,
+        merge: snake.merge,
+        mergeHold: snake.mergeHold,
+        mergeEnergy: snake.mergeEnergy,
+        mergeExhausted: snake.mergeExhausted,
+        mergeEmptyNotified: snake.mergeEmptyNotified,
+        mergeIntent: snake.mergeIntent,
+        mergeDrainTimer: snake.mergeDrainTimer,
+        lengthenCharge: snake.lengthenCharge,
+        shortenCharge: snake.shortenCharge,
+        manualLengthOffset: snake.manualLengthOffset,
+        boostHold: snake.boostHold,
+        boostEmitClock: snake.boostEmitClock,
+        spitCooldown: snake.spitCooldown,
+        spikeScale: snake.spikeScale,
+        spikeDragSeverity: snake.spikeDragSeverity,
+        digestMass: snake.digestMass,
+        stun: snake.stun,
+        invulnerable: snake.invulnerable,
+        kills: snake.kills,
+        respawnTimer: snake.respawnTimer,
+        segments: snake.segments.map((segment) => ({
+          x: segment.x,
+          y: segment.y,
+          mass: segment.mass,
+          wobble: segment.wobble,
+        })),
+      })),
+      foods: game.foods.map((food) => ({ ...food })),
+      shots: game.shots.map((shot) => ({
+        x: shot.x,
+        y: shot.y,
+        vx: shot.vx,
+        vy: shot.vy,
+        mass: shot.mass,
+        radius: shot.radius,
+        color: shot.color,
+        ownerId: shot.owner?.id ?? null,
+        life: shot.life,
+        age: shot.age,
+        spin: shot.spin,
+      })),
+      spikes: game.spikes.map((spike) => ({ ...spike })),
+      particles: game.particles.slice(-180).map((particle) => ({ ...particle })),
+      texts: game.texts.slice(-36).map((text) => ({ ...text })),
+    };
+  }
+
+  function hydrateSnake(data) {
+    const skinIndex = clamp(Number.isInteger(data.skinIndex) ? data.skinIndex : 0, 0, palettes.length - 1);
+    const segments = Array.isArray(data.segments)
+      ? data.segments.map((segment) => ({
+          x: Number(segment.x) || 0,
+          y: Number(segment.y) || 0,
+          mass: Math.max(1, Number(segment.mass) || 1),
+          wobble: Number(segment.wobble) || 0,
+        }))
+      : [];
+    const head = segments[0] || { x: 0, y: 0 };
+
+    return {
+      id: data.id,
+      name: data.name || "Guest",
+      color: paletteForSkin(skinIndex),
+      skinIndex,
+      isPlayer: data.id === onlineSelfId,
+      isHuman: Boolean(data.isHuman),
+      demoBot: false,
+      segments,
+      angle: Number(data.angle) || 0,
+      targetAngle: Number(data.targetAngle) || 0,
+      merge: Number(data.merge) || 0,
+      mergeHold: Boolean(data.mergeHold),
+      mergeEnergy: clamp(Number(data.mergeEnergy) || 0, 0, 1),
+      mergeExhausted: Boolean(data.mergeExhausted),
+      mergeEmptyNotified: Boolean(data.mergeEmptyNotified),
+      mergeIntent: Boolean(data.mergeIntent),
+      mergeDrainTimer: Math.max(0, Number(data.mergeDrainTimer) || 0),
+      lengthenCharge: clamp(Number(data.lengthenCharge) || 0, 0, 1),
+      shortenCharge: clamp(Number(data.shortenCharge) || 0, 0, 1),
+      manualLengthOffset: Number(data.manualLengthOffset) || 0,
+      boostHold: Boolean(data.boostHold),
+      boostEmitClock: Number(data.boostEmitClock) || 0,
+      spitCooldown: Math.max(0, Number(data.spitCooldown) || 0),
+      spikeScale: Number(data.spikeScale) || 1,
+      spikeDragSeverity: Number(data.spikeDragSeverity) || 0,
+      digestMass: Math.max(0, Number(data.digestMass) || 0),
+      stun: Math.max(0, Number(data.stun) || 0),
+      invulnerable: Math.max(0, Number(data.invulnerable) || 0),
+      alive: Boolean(data.alive),
+      kills: Number(data.kills) || 0,
+      respawnTimer: Math.max(0, Number(data.respawnTimer) || 0),
+      ai: {
+        timer: 0,
+        targetX: head.x,
+        targetY: head.y,
+        mode: "food",
+      },
+    };
+  }
+
+  function applyOnlineWorldState(state) {
+    if (!onlineGame.active || onlineGame.hosting || !state) return;
+
+    game.elapsed = Number(state.elapsed) || game.elapsed;
+    game.snakes = Array.isArray(state.snakes) ? state.snakes.map(hydrateSnake) : [];
+    game.player = game.snakes.find((snake) => snake.id === onlineSelfId) || game.snakes.find((snake) => snake.isHuman) || null;
+    game.foods = Array.isArray(state.foods) ? state.foods.map((food) => ({ ...food })) : [];
+    game.shots = Array.isArray(state.shots)
+      ? state.shots.map((shot) => ({
+          ...shot,
+          owner: null,
+        }))
+      : [];
+    game.spikes = Array.isArray(state.spikes) ? state.spikes.map((spike) => ({ ...spike })) : [];
+    game.particles = Array.isArray(state.particles) ? state.particles.map((particle) => ({ ...particle })) : [];
+    game.texts = Array.isArray(state.texts) ? state.texts.map((text) => ({ ...text })) : [];
+    onlineGame.snapshotAge = 0;
+  }
+
+  function maybeSendOnlineWorldState(dt) {
+    if (!onlineGame.active || !onlineGame.hosting) return;
+
+    onlineGame.lastStateSent += dt;
+    if (onlineGame.lastStateSent < ONLINE_STATE_INTERVAL) return;
+    onlineGame.lastStateSent = 0;
+    sendOnline("world_state", { state: serializeWorldState() });
+  }
+
+  function onlineParticipants(room) {
+    const players = Array.isArray(room?.players) ? room.players : [];
+    const bots = Array.isArray(room?.bots) ? room.bots : [];
+    return [
+      ...players.map((player) => ({ ...player, isHuman: true })),
+      ...bots.map((bot) => ({ ...bot, isHuman: false })),
+    ].slice(0, 11);
+  }
+
+  function syncOnlineRoster(room) {
+    if (!onlineGame.active || !onlineGame.hosting || !room) return;
+
+    const participants = onlineParticipants(room);
+    const participantIds = new Set(participants.map((participant) => participant.id));
+
+    for (const participant of participants) {
+      let snake = game.snakes.find((candidate) => candidate.id === participant.id);
+      const skinIndex = clamp(Number.isInteger(participant.skinIndex) ? participant.skinIndex : 0, 0, palettes.length - 1);
+
+      if (!snake) {
+        const angle = Math.random() * TAU;
+        const distance = randomRange(360, 680);
+        snake = createSnake(
+          participant.id,
+          Math.cos(angle) * distance,
+          Math.sin(angle) * distance,
+          paletteForSkin(skinIndex),
+          participant.id === onlineSelfId,
+          {
+            name: participant.name,
+            skinIndex,
+            isHuman: participant.isHuman,
+            invulnerable: 1.2,
+          },
+        );
+        game.snakes.push(snake);
+      }
+
+      snake.name = participant.name || snake.name;
+      snake.skinIndex = skinIndex;
+      snake.color = paletteForSkin(skinIndex);
+      snake.isHuman = Boolean(participant.isHuman);
+      snake.isPlayer = participant.id === onlineSelfId;
+      if (snake.isPlayer) game.player = snake;
+    }
+
+    game.snakes = game.snakes.filter((snake) => !snake.isHuman || participantIds.has(snake.id));
+
+    const humanCount = game.snakes.filter((snake) => snake.isHuman).length;
+    let botOverflow = game.snakes.filter((snake) => !snake.isHuman).length - Math.max(0, 11 - humanCount);
+    for (let index = game.snakes.length - 1; index >= 0 && botOverflow > 0; index -= 1) {
+      if (game.snakes[index].isHuman) continue;
+      game.snakes.splice(index, 1);
+      botOverflow -= 1;
+    }
+  }
+
+  function startOnlineMatch(room = onlineRoom) {
+    if (!room) {
+      setOnlineStatus("先创建或加入一个房间。", "error");
+      return;
+    }
+
+    onlineGame.active = true;
+    onlineGame.roomCode = room.code;
+    onlineGame.hostId = room.hostId || room.players?.[0]?.id || onlineSelfId;
+    onlineGame.hosting = onlineSelfId === onlineGame.hostId;
+    onlineGame.inputs.clear();
+    onlineGame.lastInputSent = ONLINE_INPUT_INTERVAL;
+    onlineGame.lastStateSent = ONLINE_STATE_INTERVAL;
+    onlineGame.snapshotAge = 0;
+
+    resetGame({ menu: false, silent: true, onlineRoom: room });
+    showToast(`房间 ${room.code} 开始`);
+  }
+
   function renderOnlineRoom(room) {
     onlineRoom = room;
+    if (onlineGame.active && room?.code === onlineGame.roomCode) {
+      onlineGame.hostId = room.hostId || room.players?.[0]?.id || onlineGame.hostId;
+      onlineGame.hosting = onlineSelfId === onlineGame.hostId;
+      syncOnlineRoster(room);
+    }
     if (!room) {
       setOnlineStatus("未加入房间。");
       return;
     }
     roomCodeInput.value = room.code;
-    setOnlineStatus(`房间 ${room.code}：真人 ${room.playerCount}/11，机器人 ${room.botCount}/11。下一步会把游戏世界同步到这个房间。`, "ready");
+    setOnlineStatus(`房间 ${room.code}：真人 ${room.playerCount}/11，机器人 ${room.botCount}/11。点击 Play 进入联机战局。`, "ready");
   }
 
   function handleOnlineMessage(event) {
@@ -827,10 +1162,30 @@
     }
 
     if (message.type === "joined_room" || message.type === "room_state") {
+      if (message.selfId) onlineSelfId = message.selfId;
       renderOnlineRoom(message.room);
       if (message.type === "joined_room") {
         showToast(`房间 ${message.room.code} 已准备`);
+        if (onlineGame.pendingLaunch === "quick" || onlineGame.pendingLaunch === "join") {
+          onlineGame.pendingLaunch = null;
+          startOnlineMatch(message.room);
+        }
       }
+      return;
+    }
+
+    if (message.type === "player_input") {
+      onlineGame.inputs.set(message.playerId, sanitizeOnlineInput(message.input));
+      return;
+    }
+
+    if (message.type === "player_command") {
+      handleOnlineCommand(message.playerId, message.command, message.delta);
+      return;
+    }
+
+    if (message.type === "world_state") {
+      applyOnlineWorldState(message.state);
       return;
     }
 
@@ -886,6 +1241,9 @@
         onlineConnecting = false;
         onlineSocket = null;
         onlineRoom = null;
+        onlineGame.active = false;
+        onlineGame.hosting = false;
+        onlineGame.pendingLaunch = null;
         setOnlineStatus("联机服务已断开。", "error");
       });
 
@@ -899,6 +1257,7 @@
 
   async function createOnlineRoom() {
     try {
+      onlineGame.pendingLaunch = null;
       await connectOnline();
       sendOnline("create_room", { profile: onlineProfile() });
     } catch {}
@@ -906,9 +1265,12 @@
 
   async function quickMatchOnline() {
     try {
+      onlineGame.pendingLaunch = "quick";
       await connectOnline();
       sendOnline("quick_match", { profile: onlineProfile() });
-    } catch {}
+    } catch {
+      onlineGame.pendingLaunch = null;
+    }
   }
 
   async function joinOnlineRoom() {
@@ -918,9 +1280,12 @@
       return;
     }
     try {
+      onlineGame.pendingLaunch = "join";
       await connectOnline();
       sendOnline("join_room", { code, profile: onlineProfile() });
-    } catch {}
+    } catch {
+      onlineGame.pendingLaunch = null;
+    }
   }
 
   function addText(x, y, value, color = "#ffffff") {
@@ -1255,7 +1620,7 @@
 
     const severity = snake.spikeDragSeverity || 0;
     const massPressure = clamp((totalMass(snake) - 180) / 900, 0, 1);
-    const passiveRate = lerp(snake.isPlayer ? 5.2 : 4.8, snake.isPlayer ? 2.6 : 2.3, massPressure);
+    const passiveRate = lerp(snake.isHuman ? 5.2 : 4.8, snake.isHuman ? 2.6 : 2.3, massPressure);
     const mergeRate = snake.mergeHold ? lerp(3.4, 1.4, massPressure) : 0;
     const rate = (passiveRate + mergeRate) * lerp(1, 0.58, severity);
     const amount = Math.min(snake.digestMass, dt * rate);
@@ -1348,6 +1713,7 @@
     snake.spikeScale = 1;
     snake.digestMass = 0;
     snake.spikeDragSeverity = 0;
+    snake.respawnTimer = onlineGame.active && snake.isHuman ? 2.6 : 0;
 
     for (const segment of snake.segments) {
       spawnFoodBurst(segment.x, segment.y, segment.mass * 0.95, snake.color.main);
@@ -1362,7 +1728,7 @@
       addText(head.x, head.y - 18, "K.O.", killer.color.light);
     }
 
-    if (snake.isPlayer && !game.menuOpen && !snake.demoBot) {
+    if (snake.isPlayer && !game.menuOpen && !snake.demoBot && !onlineGame.active) {
       game.gameOver = true;
       finalScore.textContent = `质量 ${Math.round(deathMass)}`;
       gameOverPanel.hidden = false;
@@ -1545,7 +1911,7 @@
     snake.stun = Math.max(0, snake.stun - dt);
     snake.spitCooldown = Math.max(0, snake.spitCooldown - dt);
 
-    if (!snake.isPlayer || snake.demoBot) updateAi(snake, dt);
+    if (!snake.isHuman || snake.demoBot) updateAi(snake, dt);
 
     const head = snake.segments[0];
     const margin = 80;
@@ -1570,7 +1936,7 @@
     const mass = totalMass(snake);
     const length = snake.segments.length;
     const perBallMass = unitMass(snake);
-    const baseSpeed = snake.isPlayer ? 210 : 198;
+    const baseSpeed = snake.isHuman ? 210 : 198;
     const massPenalty = clamp(Math.sqrt(mass) * 1.55, 14, 82);
     const ballSizePenalty = clamp(Math.sqrt(perBallMass) * 8.2, 14, 112);
     const lengthDelta = length - desiredNormalSegments(mass);
@@ -1830,13 +2196,64 @@
     }
   }
 
+  function respawnSnakeBody(snake) {
+    const x = worldRand();
+    const y = worldRand();
+    const angle = Math.random() * TAU;
+    const startMass = randomRange(15.5, 17.5);
+
+    snake.segments = [];
+    for (let index = 0; index < MIN_SEGMENTS; index += 1) {
+      snake.segments.push(makeSegment(x - Math.cos(angle) * index * 18, y - Math.sin(angle) * index * 18, startMass));
+    }
+
+    snake.angle = angle;
+    snake.targetAngle = angle;
+    snake.merge = 0;
+    snake.mergeHold = false;
+    snake.mergeEnergy = 1;
+    snake.mergeExhausted = false;
+    snake.mergeEmptyNotified = false;
+    snake.mergeIntent = false;
+    snake.mergeDrainTimer = 0;
+    snake.lengthenCharge = 1;
+    snake.shortenCharge = 1;
+    snake.manualLengthOffset = 0;
+    snake.boostHold = false;
+    snake.boostEmitClock = 0;
+    snake.spitCooldown = 0;
+    snake.spikeScale = 1;
+    snake.spikeDragSeverity = 0;
+    snake.digestMass = 0;
+    snake.stun = 0;
+    snake.invulnerable = 1.2;
+    snake.alive = true;
+    snake.respawnTimer = 0;
+  }
+
+  function respawnOnlineHumans(dt) {
+    if (!onlineGame.active || !onlineGame.hosting) return;
+
+    for (const snake of game.snakes) {
+      if (!snake.isHuman || snake.alive) continue;
+      snake.respawnTimer = Math.max(0, (snake.respawnTimer || 2.6) - dt);
+      if (snake.respawnTimer <= 0) {
+        respawnSnakeBody(snake);
+        addText(snake.segments[0].x, snake.segments[0].y - 24, "READY", snake.color.light);
+      }
+    }
+  }
+
   function maintainWorld(dt) {
     while (ambientFoodCount() < FOOD_TARGET) spawnFood();
     trimDroppedFood();
     while (game.spikes.length < SPIKE_TARGET) spawnSpike();
 
-    const aiCount = game.snakes.filter((snake) => snake.alive && !snake.isPlayer).length;
-    if (aiCount < AI_TARGET) {
+    respawnOnlineHumans(dt);
+
+    const aiTarget = onlineGame.active ? Math.max(0, 11 - game.snakes.filter((snake) => snake.isHuman).length) : AI_TARGET;
+    const aiCount = game.snakes.filter((snake) => snake.alive && !snake.isHuman).length;
+    if (aiCount < aiTarget) {
       game.respawnClock -= dt;
       if (game.respawnClock <= 0) {
         game.respawnClock = 1.2;
@@ -1911,6 +2328,7 @@
 
   function update(dt) {
     updatePointerWorld();
+    sendOnlineInput(dt);
 
     if (game.paused || game.gameOver) {
       updateUi(dt);
@@ -1918,7 +2336,20 @@
       return;
     }
 
-    updatePlayerInput();
+    if (onlineGame.active && !onlineGame.hosting) {
+      onlineGame.snapshotAge += dt;
+      updateParticles(dt);
+      updateCamera(dt);
+      updateUi(dt);
+      return;
+    }
+
+    if (onlineGame.active) {
+      applyOnlineHostInputs();
+    } else {
+      updatePlayerInput();
+    }
+
     for (const snake of game.snakes) updateSnake(snake, dt);
 
     updateFoodCollision();
@@ -1926,11 +2357,12 @@
     updateSpikeCollision(dt);
     resolveSnakeCollisions();
 
-    game.snakes = game.snakes.filter((snake) => snake.alive || snake.isPlayer);
+    game.snakes = game.snakes.filter((snake) => snake.alive || snake.isPlayer || snake.isHuman);
     maintainWorld(dt);
     updateParticles(dt);
     updateCamera(dt);
     updateUi(dt);
+    maybeSendOnlineWorldState(dt);
   }
 
   function isVisible(x, y, radius = 0) {
@@ -2394,6 +2826,15 @@
   function resetGame(options = {}) {
     const menu = Boolean(options.menu);
     const silent = Boolean(options.silent);
+    const onlineRoomOption = options.onlineRoom || null;
+
+    if (!onlineRoomOption) {
+      onlineGame.active = false;
+      onlineGame.hosting = false;
+      onlineGame.roomCode = null;
+      onlineGame.hostId = null;
+      onlineGame.inputs.clear();
+    }
 
     game.snakes = [];
     game.foods = [];
@@ -2412,22 +2853,49 @@
     gameOverPanel.hidden = true;
     exitPromptPanel.hidden = true;
 
-    const spawnX = randomRange(-220, 220);
-    const spawnY = randomRange(-220, 220);
-    const playerColor = currentPlayerPalette();
-    game.player = createSnake(0, spawnX, spawnY, playerColor, true, {
-      name: profile.name,
-      demoBot: menu,
-      invulnerable: menu ? Number.POSITIVE_INFINITY : 0.75,
-    });
-    game.snakes.push(game.player);
+    if (onlineRoomOption) {
+      const participants = onlineParticipants(onlineRoomOption);
+      const spawnRadius = 470;
+
+      participants.forEach((participant, index) => {
+        const angle = (index / Math.max(1, participants.length)) * TAU + randomRange(-0.18, 0.18);
+        const x = Math.cos(angle) * spawnRadius + randomRange(-90, 90);
+        const y = Math.sin(angle) * spawnRadius + randomRange(-90, 90);
+        const skinIndex = clamp(Number.isInteger(participant.skinIndex) ? participant.skinIndex : index, 0, palettes.length - 1);
+        const isLocalPlayer = participant.id === onlineSelfId;
+        const snake = createSnake(participant.id, x, y, paletteForSkin(skinIndex), isLocalPlayer, {
+          name: participant.name,
+          skinIndex,
+          isHuman: participant.isHuman,
+          invulnerable: 1.2,
+        });
+        game.snakes.push(snake);
+        if (isLocalPlayer) game.player = snake;
+      });
+
+      game.player ||= game.snakes.find((snake) => snake.isHuman) || game.snakes[0] || null;
+    } else {
+      const spawnX = randomRange(-220, 220);
+      const spawnY = randomRange(-220, 220);
+      const playerColor = currentPlayerPalette();
+      game.player = createSnake(0, spawnX, spawnY, playerColor, true, {
+        name: profile.name,
+        skinIndex: profile.skinIndex,
+        demoBot: menu,
+        invulnerable: menu ? Number.POSITIVE_INFINITY : 0.75,
+      });
+      game.snakes.push(game.player);
+    }
+
     game.camera.x = game.player.segments[0].x;
     game.camera.y = game.player.segments[0].y;
     game.camera.zoom = menu ? 0.86 : 0.92;
 
     for (let index = 0; index < FOOD_TARGET; index += 1) spawnFood();
     for (let index = 0; index < SPIKE_TARGET; index += 1) spawnSpike();
-    for (let index = 0; index < AI_TARGET; index += 1) spawnAiSnake();
+    if (!onlineRoomOption) {
+      for (let index = 0; index < AI_TARGET; index += 1) spawnAiSnake();
+    }
 
     setMenuVisibility(menu);
     pauseButton.textContent = "II";
@@ -2505,9 +2973,15 @@
 
     keys.add(event.code);
 
-    if (!event.repeat && event.code === "KeyQ") adjustSnakeLength(game.player, LENGTH_ADJUST_STEP);
-    if (!event.repeat && event.code === "KeyE") adjustSnakeLength(game.player, -LENGTH_ADJUST_STEP);
-    if (!event.repeat && event.code === "KeyF") spitFood(game.player);
+    if (!event.repeat && event.code === "KeyQ") {
+      if (onlineGame.active) sendOnlineLengthCommand(LENGTH_ADJUST_STEP);
+      else adjustSnakeLength(game.player, LENGTH_ADJUST_STEP);
+    }
+    if (!event.repeat && event.code === "KeyE") {
+      if (onlineGame.active) sendOnlineLengthCommand(-LENGTH_ADJUST_STEP);
+      else adjustSnakeLength(game.player, -LENGTH_ADJUST_STEP);
+    }
+    if (!onlineGame.active && !event.repeat && event.code === "KeyF") spitFood(game.player);
     if (event.code === "KeyP") togglePause();
     if (event.code === "KeyR") resetGame({ menu: false, silent: true });
   });
