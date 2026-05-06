@@ -1121,8 +1121,8 @@
 
     onlineGame.active = true;
     onlineGame.roomCode = room.code;
-    onlineGame.hostId = room.hostId || room.players?.[0]?.id || onlineSelfId;
-    onlineGame.hosting = onlineSelfId === onlineGame.hostId;
+    onlineGame.hostId = null;
+    onlineGame.hosting = false;
     onlineGame.inputs.clear();
     onlineGame.lastInputSent = ONLINE_INPUT_INTERVAL;
     onlineGame.lastStateSent = ONLINE_STATE_INTERVAL;
@@ -1135,9 +1135,8 @@
   function renderOnlineRoom(room) {
     onlineRoom = room;
     if (onlineGame.active && room?.code === onlineGame.roomCode) {
-      onlineGame.hostId = room.hostId || room.players?.[0]?.id || onlineGame.hostId;
-      onlineGame.hosting = onlineSelfId === onlineGame.hostId;
-      syncOnlineRoster(room);
+      onlineGame.hostId = null;
+      onlineGame.hosting = false;
     }
     if (!room) {
       setOnlineStatus("未加入房间。");
@@ -1169,6 +1168,7 @@
         if (onlineGame.pendingLaunch === "quick" || onlineGame.pendingLaunch === "join") {
           onlineGame.pendingLaunch = null;
           startOnlineMatch(message.room);
+          if (message.state) applyOnlineWorldState(message.state);
         }
       }
       return;
@@ -2906,6 +2906,10 @@
 
   function togglePause() {
     if (game.gameOver || game.menuOpen || game.exitPromptOpen) return;
+    if (onlineGame.active) {
+      showToast("联机战局由服务器运行");
+      return;
+    }
     game.paused = !game.paused;
     pauseButton.textContent = game.paused ? ">" : "II";
     showToast(game.paused ? "PAUSED" : "GO");
@@ -2983,7 +2987,7 @@
     }
     if (!onlineGame.active && !event.repeat && event.code === "KeyF") spitFood(game.player);
     if (event.code === "KeyP") togglePause();
-    if (event.code === "KeyR") resetGame({ menu: false, silent: true });
+    if (event.code === "KeyR" && !onlineGame.active) resetGame({ menu: false, silent: true });
   });
 
   window.addEventListener("keyup", (event) => {
@@ -3037,8 +3041,20 @@
     renderTutorialPanel();
   });
   pauseButton.addEventListener("click", togglePause);
-  restartButton.addEventListener("click", () => resetGame({ menu: false, silent: true }));
-  playAgainButton.addEventListener("click", () => resetGame({ menu: false, silent: true }));
+  restartButton.addEventListener("click", () => {
+    if (onlineGame.active) {
+      showToast("联机战局由服务器运行");
+      return;
+    }
+    resetGame({ menu: false, silent: true });
+  });
+  playAgainButton.addEventListener("click", () => {
+    if (onlineGame.active) {
+      showToast("联机战局由服务器运行");
+      return;
+    }
+    resetGame({ menu: false, silent: true });
+  });
   gameOverLobbyButton.addEventListener("click", returnToLobby);
   stayInGameButton.addEventListener("click", closeExitPrompt);
   confirmLobbyButton.addEventListener("click", returnToLobby);
